@@ -1,0 +1,66 @@
+CREATE OR REPLACE PROCEDURE parse_dl2_to_dl3(dataset STRING)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+AS
+$$
+from snowflake.snowpark import Session
+import json
+
+def main(session: Session, dataset: str):
+
+    # Step 1: Load metadata for the selected DL2 dataset
+    md_df = session.sql(f"""
+        SELECT target_table, column_name, start_pos, length, data_type
+        FROM layout_registry
+        WHERE source_dataset = '{dataset}'
+        ORDER BY target_table, start_pos
+    """).collect()
+
+    # Organize metadata grouped by target table
+    table_map = {}
+    for row in md_df:
+        tgt = row['TARGET_TABLE']
+        if tgt not in table_map:
+            table_map[tgt] = []
+        table_map[tgt].append(row)
+
+    log_messages = []
+
+    # Step 2: Build & execute dynamic SQL for each target DL3 table
+    for tgt_table, rules in table_map.items():
+
+        col_names = []
+        col_exprs = []
+
+        for r in rules:
+            column = r['COLUMN_NAME']
+            start = r['START_POS']
+            length = r['LENGTH']
+            dtype = r['DATA_TYPE']
+
+            col_names.append(column)
+
+            expr = f"SUBSTR(raw_line, {start}, {length})"
+
+            if dtype.upper() == "NUMBER":
+                expr = f"TO_NUMBER({expr})"
+            elif dtype.upper() == "DATE":
+                expr = f"TO_DATE({expr}, 'YYYYMMDD')"
+
+            col_exprs.append(f"{expr} AS {column}")
+
+        insert_sql = f"""
+            INSERT INTO {tgt_table} ({", ".join(col_names)})
+            SELECT {", ".join(col_exprs)}
+            FROM dl2_raw
+            WHERE dataset = '{dataset}'
+        """
+
+        session.sql(insert_sql).collect()
+        log_messages.append(f"Loaded into DL3 table: {tgt_table}")
+
+    return "\n".join(log_messages)
+$$;
