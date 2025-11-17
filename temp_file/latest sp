@@ -1,0 +1,46 @@
+CREATE OR REPLACE PROCEDURE preview_dl2_data(dl2_table STRING, dl3_table STRING)
+RETURNS TABLE ()
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+AS
+$$
+from snowflake.snowpark.functions import col, substr, to_number, to_date
+
+def main(session, dl2_table: str, dl3_table: str):
+
+    # Load metadata rows (one per column)
+    md = session.sql(f"""
+        SELECT COLUMN_NAMES, POSITIONS_STARTS, POSITIONS_LENGTH, DATA_TYPE
+        FROM layout_registry
+        WHERE DL2_TABLE_NAME = '{dl2_table}' AND DL3_TABLE_NAME = '{dl3_table}'
+        ORDER BY POSITIONS_STARTS
+    """).collect()
+
+    if len(md) == 0:
+        raise Exception(f"No metadata found for DL2_TABLE={dl2_table} and DL3_TABLE={dl3_table}")
+
+    # Get the DL2 raw data rows filtered by your dataset (assuming MFP_ASSET_NM = dl2_table)
+    df = session.table("DL2_RAW").filter(col("MFP_ASSET_NM") == dl2_table)
+
+    select_exprs = []
+
+    for r in md:
+        col_name = r['COLUMN_NAMES']
+        start = int(r['POSITIONS_STARTS'])
+        length = int(r['POSITIONS_LENGTH'])
+        dtype = r['DATA_TYPE']
+
+        expr = substr(col("SOURCE_DATA"), start, length)
+
+        if dtype.upper() == "NUMBER":
+            expr = to_number(expr)
+        elif dtype.upper() == "DATE":
+            expr = to_date(expr, 'YYYYMMDD')
+
+        select_exprs.append(expr.alias(col_name))
+
+    # Return parsed data as a SELECT statement
+    return df.select(select_exprs)
+$$;
