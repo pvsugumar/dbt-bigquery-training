@@ -1,0 +1,74 @@
+CREATE OR REPLACE PROCEDURE parse_dl2_to_dl3(dataset STRING)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    // Step 1: Load metadata grouped by target table
+    var md_sql = `
+        SELECT target_table, column_name, start_pos, length, data_type
+        FROM layout_registry
+        WHERE source_dataset = '` + dataset + `'
+        ORDER BY target_table, start_pos
+    `;
+    
+    var stmt = snowflake.createStatement({ sqlText: md_sql });
+    var rs = stmt.execute();
+    
+    // Registry: { target_table: [ column rules ] }
+    var tableMap = {};
+    
+    while (rs.next()) {
+        let tgt = rs.getColumnValue(1);
+        let col = rs.getColumnValue(2);
+        let start = rs.getColumnValue(3);
+        let len = rs.getColumnValue(4);
+        let type = rs.getColumnValue(5);
+        
+        if (!tableMap[tgt]) tableMap[tgt] = [];
+        
+        tableMap[tgt].push({
+            column: col,
+            start_pos: start,
+            length: len,
+            data_type: type
+        });
+    }
+    
+    // Step 2: Build dynamic INSERT statements per target table
+    var log = [];
+    
+    for (var tgt in tableMap) {
+        let colRules = tableMap[tgt];
+        let colNames = [];
+        let colExprs = [];
+        
+        for (var i = 0; i < colRules.length; i++) {
+            let r = colRules[i];
+            colNames.push(r.column);
+            
+            let expr = `SUBSTR(raw_line, ${r.start_pos}, ${r.length})`;
+            
+            if (r.data_type == 'NUMBER') {
+                expr = `TO_NUMBER(${expr})`;
+            } else if (r.data_type == 'DATE') {
+                expr = `TO_DATE(${expr}, 'YYYYMMDD')`;
+            }
+            
+            colExprs.push(expr + ` AS ${r.column}`);
+        }
+        
+        let insert_sql = `
+            INSERT INTO ${tgt} (${colNames.join(', ')})
+            SELECT ${colExprs.join(', ')}
+            FROM dl2_raw
+            WHERE dataset = '` + dataset + `'
+        `;
+        
+        var stmtInsert = snowflake.createStatement({ sqlText: insert_sql });
+        stmtInsert.execute();
+        
+        log.push("Loaded DL3 table: " + tgt);
+    }
+    
+    return log.join('; ');
+$$;
